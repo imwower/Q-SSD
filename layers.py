@@ -130,7 +130,7 @@ class QuantizedStateSpaceMixer(nn.Module):
             inner_dim,
             inner_dim,
             kernel_size=d_conv,
-            padding=d_conv // 2,
+            padding=(d_conv - 1) // 2,  # keep output length equal to input length
             groups=inner_dim,
         )
 

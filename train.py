@@ -174,7 +174,7 @@ def train_loop(
     )
 
     use_scaler = device.type == "cuda"
-    scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
     amp_dtype = torch.bfloat16 if device.type == "mps" else torch.float16
     autocast = (
         lambda: torch.amp.autocast(device_type=device.type, enabled=True, dtype=amp_dtype)
