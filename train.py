@@ -46,10 +46,14 @@ def train_loop(
     device = get_device()
     print(f"Using device: {device}")
 
+    pin = device.type == "cuda"  # pin_memory unsupported on mps; avoid warning
     train_loader, val_loader, stoi, itos = get_dataloaders(
         batch_size=batch_size,
         block_size=block_size,
         num_workers=0,
+        val_ratio=0.1,
+        data_path="input.txt",
+        pin_memory=pin,
     )
     vocab_size = len(stoi)
 
@@ -64,7 +68,10 @@ def train_loop(
     model = QSSDModel(config).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
-    scaler = torch.cuda.amp.GradScaler(enabled=device.type in ("cuda", "mps"))
+    use_amp = device.type == "cuda"  # CUDA amp only; mps falls back to FP32
+    scaler = torch.amp.GradScaler(device_type="cuda", enabled=use_amp)
+
+    autocast = torch.amp.autocast
 
     def run_epoch(loader, train: bool) -> Tuple[float, int]:
         model.train(train)
@@ -76,7 +83,7 @@ def train_loop(
             x = x.to(device)
             y = y.to(device)
 
-            with torch.cuda.amp.autocast(enabled=device.type in ("cuda", "mps")):
+            with autocast(device_type="cuda", enabled=use_amp):
                 logits = model(x)
                 loss = nn.functional.cross_entropy(
                     logits.view(-1, vocab_size), y.view(-1)
@@ -84,9 +91,13 @@ def train_loop(
 
             if train:
                 optimizer.zero_grad()
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
+                if use_amp:
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    optimizer.step()
 
             total_loss += loss.item()
             total_steps += 1

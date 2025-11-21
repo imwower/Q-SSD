@@ -91,6 +91,7 @@ def get_dataloaders(
     data_path: str = "input.txt",
     val_ratio: float = 0.1,
     num_workers: int = 0,
+    pin_memory: bool = True,
 ) -> Tuple[DataLoader, DataLoader, Dict[str, int], List[str]]:
     """
     Create train/val dataloaders and return shared tokenizer.
@@ -122,14 +123,14 @@ def get_dataloaders(
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=pin_memory,
     )
     val_loader = DataLoader(
         val_ds,
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=pin_memory,
     )
     return train_loader, val_loader, stoi, itos
 
