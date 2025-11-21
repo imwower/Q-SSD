@@ -78,6 +78,7 @@ def train_loop(
         total_loss = 0.0
         total_steps = 0
         start_time = time.time()
+        log_interval = max(1, len(loader) // 5)
 
         for step, (x, y) in enumerate(loader, 1):
             x = x.to(device)
@@ -102,20 +103,24 @@ def train_loop(
             total_loss += loss.item()
             total_steps += 1
 
-            # Print a few times per epoch
-            if train and step % max(1, math.ceil(len(loader) / 5)) == 0:
+            # Print a few times per epoch (and on the first step) for observability.
+            if step == 1 or step % log_interval == 0 or step == len(loader):
                 elapsed = time.time() - start_time
                 avg_loss = total_loss / total_steps
                 print(
+                    f"{'Train' if train else 'Val'} "
                     f"Iter {step}/{len(loader)} | "
-                    f"{'Train' if train else 'Val'} Loss: {avg_loss:.4f} | "
+                    f"Avg Loss: {avg_loss:.4f} | "
                     f"Time: {elapsed:.1f}s"
                 )
 
         return total_loss / max(total_steps, 1), total_steps
 
     for epoch in range(1, epochs + 1):
-        print(f"\nEpoch {epoch}")
+        print(f"\nEpoch {epoch} | "
+              f"train steps: {len(train_loader)}, "
+              f"val steps: {len(val_loader)}, "
+              f"batch_size: {batch_size}")
         train_loss, _ = run_epoch(train_loader, train=True)
         val_loss, _ = run_epoch(val_loader, train=False)
         print(
