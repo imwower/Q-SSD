@@ -70,8 +70,12 @@ def train_loop(
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
     use_amp = device.type == "cuda"  # CUDA amp only; mps/cpu fall back to FP32
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
-    autocast = torch.cuda.amp.autocast if use_amp else nullcontext
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    autocast = (
+        lambda: torch.amp.autocast(device_type="cuda", enabled=use_amp)
+        if use_amp
+        else nullcontext()
+    )
 
     def run_epoch(loader, train: bool) -> Tuple[float, int]:
         model.train(train)
