@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import math
 import time
+from contextlib import nullcontext
 from typing import Tuple
 
 import torch
@@ -68,10 +69,9 @@ def train_loop(
     model = QSSDModel(config).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
-    use_amp = device.type == "cuda"  # CUDA amp only; mps falls back to FP32
-    scaler = torch.amp.GradScaler(device_type="cuda", enabled=use_amp)
-
-    autocast = torch.amp.autocast
+    use_amp = device.type == "cuda"  # CUDA amp only; mps/cpu fall back to FP32
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    autocast = torch.cuda.amp.autocast if use_amp else nullcontext
 
     def run_epoch(loader, train: bool) -> Tuple[float, int]:
         model.train(train)
@@ -83,7 +83,7 @@ def train_loop(
             x = x.to(device)
             y = y.to(device)
 
-            with autocast(device_type="cuda", enabled=use_amp):
+            with autocast():
                 logits = model(x)
                 loss = nn.functional.cross_entropy(
                     logits.view(-1, vocab_size), y.view(-1)
