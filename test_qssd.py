@@ -65,7 +65,7 @@ def tiny_training_step() -> None:
     grads_ok = all(
         p.grad is not None for p in model.parameters() if isinstance(p, torch.Tensor)
     )
-    print("Loss:", float(loss))
+    print("Loss:", loss.item())
     print("All parameter grads exist:", grads_ok)
 
 
