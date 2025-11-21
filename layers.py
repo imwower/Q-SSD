@@ -130,7 +130,7 @@ class QuantizedStateSpaceMixer(nn.Module):
             inner_dim,
             inner_dim,
             kernel_size=d_conv,
-            padding=(d_conv - 1) // 2,  # keep output length equal to input length
+            padding=d_conv // 2,
             groups=inner_dim,
         )
 
@@ -203,6 +203,10 @@ class QuantizedStateSpaceMixer(nn.Module):
         if layer_state is None or x_proj.size(1) > 1:
             # Training / full sequence path.
             x_conv = self.short_conv(x_proj.transpose(1, 2)).transpose(1, 2)
+            if x_conv.size(1) != x_proj.size(1):
+                t = min(x_conv.size(1), x_proj.size(1))
+                x_conv = x_conv[:, :t]
+                x_proj = x_proj[:, :t]
         else:
             # Streaming single-step path.
             x_conv = self._causal_conv_step(x_proj, layer_state)
