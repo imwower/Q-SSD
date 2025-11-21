@@ -1,8 +1,5 @@
 """
-Core Q-SSD layers built on top of BitLinear/RMSNorm and Mamba SSM.
-
-This module wires quantized projections into the mixer and channel blocks
-while keeping the SSM core in higher precision (FP16/BF16/FP32).
+Core Q-SSD layers built on top of BitLinear/RMSNorm and a pure PyTorch Mamba-style SSM.
 """
 from __future__ import annotations
 
@@ -15,10 +12,94 @@ import torch.nn.functional as F
 from quantization import BitLinear, RMSNorm
 
 
+class QuantizedMambaBlock(nn.Module):
+    """Minimal Mamba/SSM block with quantized projections and high-precision state update.
+
+    Args:
+        d_model: Model dimension.
+        d_state: State dimension per channel.
+        activation_bits: Activation quantization bits for BitLinear.
+        bitnet_scale: Whether to apply BitNet scaling in BitLinear.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        d_state: int,
+        *,
+        activation_bits: Optional[int] = 8,
+        bitnet_scale: bool = True,
+    ) -> None:
+        super().__init__()
+        self.d_model = d_model
+        self.d_state = d_state
+
+        # Quantized projections for input-dependent B, C, and delta.
+        self.x_proj = BitLinear(
+            d_model,
+            2 * d_model,
+            activation_bits=activation_bits,
+            bitnet_scale=bitnet_scale,
+        )
+        self.dt_proj = BitLinear(
+            d_model,
+            d_model,
+            activation_bits=activation_bits,
+            bitnet_scale=bitnet_scale,
+        )
+
+        # High-precision dynamics parameters (kept in FP32).
+        self.A_log = nn.Parameter(torch.zeros(d_model))
+
+    def forward(
+        self,
+        x: Tensor,
+        state: Optional[Dict[str, Tensor]] = None,
+    ) -> Tensor:
+        """Runs the selective scan over a sequence.
+
+        Args:
+            x: Input tensor of shape (B, T, D).
+            state: Optional state dict storing "h" for inference or streaming.
+        Returns:
+            Tensor of shape (B, T, D).
+        """
+        bsz, seq_len, dim = x.shape
+        assert dim == self.d_model, "Input dim must match d_model."
+
+        A = -F.softplus(self.A_log).to(dtype=torch.float32)  # ensure negative for stability
+
+        # Initialize hidden state in high precision.
+        if state is not None and "h" in state:
+            h = state["h"].to(dtype=torch.float32, device=x.device)
+        else:
+            h = torch.zeros(bsz, dim, device=x.device, dtype=torch.float32)
+
+        outs = []
+        for t in range(seq_len):
+            xt = x[:, t, :]
+
+            dt = F.softplus(self.dt_proj(xt)).to(dtype=torch.float32)
+            x_proj = self.x_proj(xt)
+            b_t, c_t = x_proj.chunk(2, dim=-1)
+            b_t = b_t.to(dtype=torch.float32)
+            c_t = c_t.to(dtype=torch.float32)
+
+            alpha = torch.exp(dt * A)  # (B, D)
+            h = alpha * h + dt * b_t
+            y_t = h * torch.tanh(c_t)
+            outs.append(y_t.to(dtype=x.dtype))
+
+        y = torch.stack(outs, dim=1)
+
+        if state is not None:
+            state["h"] = h.detach()
+
+        return y
+
+
 class QuantizedStateSpaceMixer(nn.Module):
-    """
-    Temporal mixing block: BitLinear input projection + depthwise conv + SSM core + BitLinear output.
-    """
+    """Temporal mixing block using quantized projections and pure PyTorch Mamba block."""
 
     def __init__(
         self,
@@ -44,7 +125,7 @@ class QuantizedStateSpaceMixer(nn.Module):
             bitnet_scale=bitnet_scale,
         )
 
-        # Short depthwise convolution to capture local context before SSM.
+        # Depthwise causal convolution (maintain buffer for inference).
         self.short_conv = nn.Conv1d(
             inner_dim,
             inner_dim,
@@ -53,26 +134,12 @@ class QuantizedStateSpaceMixer(nn.Module):
             groups=inner_dim,
         )
 
-        # High-precision SSM core (keeps internal A, B, C in FP16/BF16/FP32).
-        try:
-            from mamba_ssm.modules.mamba_simple import Mamba
-
-            # NOTE: Mamba internally uses nn.Linear; to fully quantize, replace those with BitLinear in the library itself.
-            self.ssm_core = Mamba(
-                d_model=inner_dim,
-                d_state=d_state,
-                d_conv=d_conv,
-                expand=1,  # already expanded via BitLinear input
-            )
-        except ImportError:
-            # Fallback: lightweight residual MLP as a placeholder when mamba_ssm is unavailable.
-            # This keeps the interface intact for smoke tests; replace with real Mamba when installed.
-            self.ssm_core = nn.Sequential(
-                nn.LayerNorm(inner_dim),
-                nn.Linear(inner_dim, inner_dim),
-                nn.SiLU(),
-                nn.Linear(inner_dim, inner_dim),
-            )
+        self.ssm_core = QuantizedMambaBlock(
+            d_model=inner_dim,
+            d_state=d_state,
+            activation_bits=activation_bits,
+            bitnet_scale=bitnet_scale,
+        )
 
         self.out_proj = BitLinear(
             inner_dim,
@@ -81,34 +148,75 @@ class QuantizedStateSpaceMixer(nn.Module):
             bitnet_scale=bitnet_scale,
         )
 
-    def forward(self, x: Tensor) -> Tensor:  # type: ignore[override]
+        self.d_conv = d_conv
+        self.inner_dim = inner_dim
+
+    def _causal_conv_step(
+        self,
+        x_proj: Tensor,
+        layer_state: Dict[str, Tensor],
+    ) -> Tensor:
+        """Performs a single causal depthwise conv step using buffered inputs."""
+        # x_proj: (B, 1, C)
+        buffer = layer_state.get("conv_buffer")
+        bsz = x_proj.size(0)
+        if buffer is None:
+            buffer = torch.zeros(
+                bsz,
+                self.inner_dim,
+                self.d_conv,
+                device=x_proj.device,
+                dtype=x_proj.dtype,
+            )
+
+        # Shift and append new token
+        x_proj_t = x_proj.transpose(1, 2)  # (B, C, 1)
+        buffer = torch.cat([buffer[:, :, 1:], x_proj_t], dim=2)
+
+        conv_out = F.conv1d(
+            buffer,
+            self.short_conv.weight,
+            self.short_conv.bias,
+            padding=0,
+            groups=self.inner_dim,
+        )
+        conv_out = conv_out.transpose(1, 2)  # (B, 1, C)
+        layer_state["conv_buffer"] = buffer.detach()
+        return conv_out
+
+    def forward(
+        self,
+        x: Tensor,
+        layer_state: Optional[Dict[str, Tensor]] = None,
+    ) -> Tensor:
+        """Forward pass with optional streaming states.
+
+        Args:
+            x: Tensor of shape (B, T, d_model).
+            layer_state: Optional dict holding "conv_buffer" and "ssm_state".
+        """
         residual = x
         x = self.norm(x)
 
-        x = self.input_proj(x)
+        x_proj = self.input_proj(x)
 
-        # Conv1d expects (B, C, T), while incoming is (B, T, C).
-        x = x.transpose(1, 2)
-        x = self.short_conv(x)
-        x = x.transpose(1, 2)
+        if layer_state is None or x_proj.size(1) > 1:
+            # Training / full sequence path.
+            x_conv = self.short_conv(x_proj.transpose(1, 2)).transpose(1, 2)
+        else:
+            # Streaming single-step path.
+            x_conv = self._causal_conv_step(x_proj, layer_state)
 
-        # Keep SSM computation in higher precision.
-        x = self.ssm_core(x)
+        ssm_state = None if layer_state is None else layer_state.setdefault("ssm_state", {})
+        x_ssm = self.ssm_core(x_conv, ssm_state)
+        x_ssm = F.silu(x_ssm)
+        x_out = self.out_proj(x_ssm)
 
-        x = F.silu(x)
-        x = self.out_proj(x)
-        # Align sequence length in case convolution padding changed it.
-        if x.shape[1] != residual.shape[1]:
-            min_t = min(x.shape[1], residual.shape[1])
-            x = x[:, :min_t]
-            residual = residual[:, :min_t]
-        return residual + x
+        return residual + x_out
 
 
 class QuantizedChannelMixer(nn.Module):
-    """
-    Channel mixing (FFN) block using SwiGLU-style gating with BitLinear projections.
-    """
+    """Channel mixing (FFN) block using SwiGLU-style gating with BitLinear projections."""
 
     def __init__(
         self,
@@ -122,7 +230,6 @@ class QuantizedChannelMixer(nn.Module):
         hidden = 4 * d_model  # expansion factor
 
         self.norm = RMSNorm(d_model, eps=rms_norm_eps)
-        # Project to gate/value branches.
         self.gate_value_proj = BitLinear(
             d_model,
             hidden * 2,
@@ -136,7 +243,11 @@ class QuantizedChannelMixer(nn.Module):
             bitnet_scale=bitnet_scale,
         )
 
-    def forward(self, x: Tensor) -> Tensor:  # type: ignore[override]
+    def forward(
+        self,
+        x: Tensor,
+        layer_state: Optional[Dict[str, Tensor]] = None,  # kept for API consistency
+    ) -> Tensor:
         residual = x
         x = self.norm(x)
 
@@ -149,6 +260,7 @@ class QuantizedChannelMixer(nn.Module):
 
 
 __all__ = [
+    "QuantizedMambaBlock",
     "QuantizedStateSpaceMixer",
     "QuantizedChannelMixer",
 ]

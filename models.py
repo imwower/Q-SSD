@@ -1,9 +1,9 @@
 """
-Q-SSD model assembly from quantized building blocks.
+Q-SSD model assembly from quantized building blocks with streaming/inference support.
 """
 from __future__ import annotations
 
-from typing import Optional
+from typing import Dict, Optional
 
 import torch
 from torch import Tensor, nn
@@ -14,10 +14,7 @@ from quantization import BitLinear, RMSNorm
 
 
 class QSSDBlock(nn.Module):
-    """
-    A single Q-SSD block: temporal mixer followed by channel mixer.
-    Each sub-layer is pre-normed and uses residual connections internally.
-    """
+    """A single Q-SSD block: temporal mixer followed by channel mixer."""
 
     def __init__(
         self,
@@ -40,16 +37,21 @@ class QSSDBlock(nn.Module):
             rms_norm_eps=config.rms_norm_eps,
         )
 
-    def forward(self, x: Tensor) -> Tensor:  # type: ignore[override]
-        x = self.mixer(x)
-        x = self.channel_mixer(x)
+    def forward(
+        self,
+        x: Tensor,
+        layer_state: Optional[Dict[str, Dict[str, Tensor]]] = None,
+    ) -> Tensor:  # type: ignore[override]
+        mixer_state = None if layer_state is None else layer_state.setdefault("mixer", {})
+        channel_state = None if layer_state is None else layer_state.setdefault("channel", {})
+
+        x = self.mixer(x, mixer_state)
+        x = self.channel_mixer(x, channel_state)
         return x
 
 
 class QSSDModel(nn.Module):
-    """
-    Quantized State Space Dual (Q-SSD) language model.
-    """
+    """Quantized State Space Dual (Q-SSD) language model with streaming inference."""
 
     def __init__(
         self,
@@ -76,26 +78,58 @@ class QSSDModel(nn.Module):
         self._init_weights()
 
     def _init_weights(self) -> None:
-        # Embedding: normal init as in many LM setups.
         nn.init.normal_(self.embed.weight, mean=0.0, std=0.02)
-        # BitLinear layers already initialized internally; ensure lm_head bias zeroed.
         if self.lm_head.bias is not None:
             nn.init.zeros_(self.lm_head.bias)
-        # RMSNorm weight is initialized to ones in its constructor.
 
-    def forward(self, input_ids: Tensor) -> Tensor:  # type: ignore[override]
-        """
+    def forward(
+        self,
+        input_ids: Tensor,
+        inference_params: Optional[Dict[str, Dict[str, Dict[str, Tensor]]]] = None,
+    ) -> Tensor:  # type: ignore[override]
+        """Full-sequence forward pass.
+
         Args:
-            input_ids: Tensor of shape (batch, seq_len) with token ids.
-        Returns:
-            logits: Tensor of shape (batch, seq_len, vocab_size).
+            input_ids: Tensor of shape (B, T).
+            inference_params: Optional streaming states; if provided, will be updated.
         """
         x = self.embed(input_ids)
-        for layer in self.layers:
-            x = layer(x)
+        layer_states = None
+        if inference_params is not None:
+            layer_states = inference_params.setdefault(
+                "layer_states", [dict() for _ in range(len(self.layers))]
+            )
+
+        for idx, layer in enumerate(self.layers):
+            state = None if layer_states is None else layer_states[idx]
+            x = layer(x, state)
         x = self.norm(x)
         logits = self.lm_head(x)
         return logits
+
+    @torch.no_grad()
+    def step(
+        self,
+        input_ids: Tensor,
+        inference_params: Dict[str, Dict[str, Dict[str, Tensor]]],
+    ) -> Tensor:
+        """O(1) incremental decoding step.
+
+        Args:
+            input_ids: Tensor of shape (B, 1) containing the next token id(s).
+            inference_params: Dict holding persistent layer states.
+        Returns:
+            Logits for the next token: Tensor of shape (B, vocab_size).
+        """
+        x = self.embed(input_ids)
+        layer_states = inference_params.setdefault(
+            "layer_states", [dict() for _ in range(len(self.layers))]
+        )
+        for idx, layer in enumerate(self.layers):
+            x = layer(x, layer_states[idx])
+        x = self.norm(x)
+        logits = self.lm_head(x)
+        return logits[:, -1, :]
 
 
 __all__ = [
