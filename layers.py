@@ -56,10 +56,10 @@ class QuantizedMambaBlock(nn.Module):
         x: Tensor,
         state: Optional[Dict[str, Tensor]] = None,
     ) -> Tensor:
-        """Runs the selective scan over a sequence.
+        """Runs the selective scan over a sequence (vectorized, no Python loop).
 
         Args:
-            x: Input tensor of shape (B, T, D).
+            x: Tensor of shape (B, T, D).
             state: Optional state dict storing "h" for inference or streaming.
         Returns:
             Tensor of shape (B, T, D).
@@ -68,32 +68,35 @@ class QuantizedMambaBlock(nn.Module):
         assert dim == self.d_model, "Input dim must match d_model."
 
         A = -F.softplus(self.A_log).to(dtype=torch.float32)  # ensure negative for stability
-
-        # Initialize hidden state in high precision.
         if state is not None and "h" in state:
-            h = state["h"].to(dtype=torch.float32, device=x.device)
+            h0 = state["h"].to(dtype=torch.float32, device=x.device)
         else:
-            h = torch.zeros(bsz, dim, device=x.device, dtype=torch.float32)
+            h0 = torch.zeros(bsz, dim, device=x.device, dtype=torch.float32)
 
-        outs = []
-        for t in range(seq_len):
-            xt = x[:, t, :]
+        # Quantized projections (stay in compute dtype), then promote to FP32 for dynamics.
+        dt = F.softplus(self.dt_proj(x)).to(dtype=torch.float32)  # (B, T, D)
+        x_proj = self.x_proj(x)
+        b_t, c_t = x_proj.chunk(2, dim=-1)
+        b_t = b_t.to(dtype=torch.float32)
+        c_t = c_t.to(dtype=torch.float32)
 
-            dt = F.softplus(self.dt_proj(xt)).to(dtype=torch.float32)
-            x_proj = self.x_proj(xt)
-            b_t, c_t = x_proj.chunk(2, dim=-1)
-            b_t = b_t.to(dtype=torch.float32)
-            c_t = c_t.to(dtype=torch.float32)
+        alpha = torch.exp(dt * A)  # (B, T, D)
 
-            alpha = torch.exp(dt * A)  # (B, D)
-            h = alpha * h + dt * b_t
-            y_t = h * torch.tanh(c_t)
-            outs.append(y_t.to(dtype=x.dtype))
+        # Prefix products for alpha to compute recurrence in closed form.
+        prefix = torch.cumprod(alpha, dim=1)  # (B, T, D)
+        prefix_shift = torch.cat(
+            [torch.ones(bsz, 1, dim, device=x.device, dtype=torch.float32), prefix[:, :-1, :]],
+            dim=1,
+        )  # prod over j<k
 
-        y = torch.stack(outs, dim=1)
+        g = dt * b_t / prefix_shift
+        cumsum = torch.cumsum(g, dim=1)
+        h = prefix * (h0.unsqueeze(1) + cumsum)  # (B, T, D)
+        y = h * torch.tanh(c_t)
+        y = y.to(dtype=x.dtype)
 
         if state is not None:
-            state["h"] = h.detach()
+            state["h"] = h[:, -1, :].detach()
 
         return y
 
