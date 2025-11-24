@@ -124,7 +124,11 @@ def generate(
 
     for _ in range(max_new_tokens):
         logits = model.step(last_id, inference_params)
-        probs = torch.softmax(logits / temperature, dim=-1)
+        logits = logits / temperature
+        logits = torch.nan_to_num(logits, neginf=-50.0, posinf=50.0)
+        probs = torch.softmax(logits, dim=-1)
+        if torch.any(~torch.isfinite(probs)):
+            probs = torch.full_like(probs, 1.0 / probs.size(-1))
         next_id = torch.multinomial(probs, num_samples=1)
         generated.append(itos[next_id.item()])
         last_id = next_id
@@ -207,6 +211,10 @@ def train_loop(
                     logits.view(-1, vocab_size), y.view(-1)
                 )
                 loss = loss / grad_accum_steps
+            if torch.isnan(loss) or torch.isinf(loss):
+                print("Encountered NaN/Inf loss, skipping step.")
+                optimizer.zero_grad(set_to_none=True)
+                continue
 
             if train:
                 if use_scaler:
