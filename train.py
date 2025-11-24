@@ -324,6 +324,15 @@ def train_loop(
 if __name__ == "__main__":
     import argparse
 
+    def parse_optional_int(val: str) -> Optional[int]:
+        """Allow passing 'None'/'none'/'-1' to mean no limit."""
+        if val is None:
+            return None
+        v = str(val).strip().lower()
+        if v in {"none", "null", "-1"}:
+            return None
+        return int(val)
+
     parser = argparse.ArgumentParser(description="Train Q-SSD on Tiny Shakespeare.")
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=16)
@@ -334,8 +343,8 @@ if __name__ == "__main__":
     parser.add_argument("--grad_accum_steps", type=int, default=2)
     parser.add_argument("--resume_from", type=str, default=None)
     parser.add_argument("--ckpt_dir", type=str, default="checkpoints")
-    parser.add_argument("--max_train_steps_per_epoch", type=int, default=200)
-    parser.add_argument("--max_val_steps_per_epoch", type=int, default=50)
+    parser.add_argument("--max_train_steps_per_epoch", type=parse_optional_int, default=200)
+    parser.add_argument("--max_val_steps_per_epoch", type=parse_optional_int, default=50)
     args = parser.parse_args()
 
     train_loop(
