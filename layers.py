@@ -94,6 +94,7 @@ class QuantizedMambaBlock(nn.Module):
         cumsum = torch.cumsum(g, dim=1)
         h = prefix * (h0.unsqueeze(1) + cumsum)  # (B, T, D)
         y = h * torch.tanh(c_t)
+        y = torch.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
         y = y.to(dtype=x.dtype)
 
         if state is not None:

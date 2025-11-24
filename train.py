@@ -207,6 +207,7 @@ def train_loop(
             # Disable autocast on MPS/CPU to avoid BF16-induced NaNs; only CUDA uses autocast.
             with (autocast(device_type="cuda", dtype=torch.float16, enabled=use_scaler) if use_scaler else torch.autograd.profiler.record_function("fp32")):
                 logits = model(x)
+                logits = torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=0.0)
                 loss = nn.functional.cross_entropy(
                     logits.view(-1, vocab_size), y.view(-1)
                 )
@@ -223,6 +224,9 @@ def train_loop(
                     loss.backward()
 
                 if step % grad_accum_steps == 0:
+                    if use_scaler:
+                        scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     if use_scaler:
                         scaler.step(optimizer)
                         scaler.update()
@@ -251,6 +255,9 @@ def train_loop(
 
         # Flush leftover grads when early breaking or non-multiple batch count.
         if train and (total_steps % grad_accum_steps) != 0:
+            if use_scaler:
+                scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             if use_scaler:
                 scaler.step(optimizer)
                 scaler.update()
@@ -316,15 +323,15 @@ def train_loop(
 
 if __name__ == "__main__":
     train_loop(
-        epochs=5,
-        batch_size=32,
-        block_size=256,
-        lr=3e-4,
-        weight_decay=0.1,
-        warmup_steps=500,
-        grad_accum_steps=4,
+        epochs=1,
+        batch_size=16,
+        block_size=128,
+        lr=1e-3,
+        weight_decay=0.01,
+        warmup_steps=50,
+        grad_accum_steps=2,
         resume_from=None,
         ckpt_dir="checkpoints",
-        max_train_steps_per_epoch=512,
-        max_val_steps_per_epoch=128,
+        max_train_steps_per_epoch=200,
+        max_val_steps_per_epoch=50,
     )
