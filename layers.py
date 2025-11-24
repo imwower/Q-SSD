@@ -75,12 +75,13 @@ class QuantizedMambaBlock(nn.Module):
 
         # Quantized projections (stay in compute dtype), then promote to FP32 for dynamics.
         dt = F.softplus(self.dt_proj(x)).to(dtype=torch.float32)  # (B, T, D)
+        dt = dt.clamp(max=10.0)
         x_proj = self.x_proj(x)
         b_t, c_t = x_proj.chunk(2, dim=-1)
         b_t = b_t.to(dtype=torch.float32)
         c_t = c_t.to(dtype=torch.float32)
 
-        alpha = torch.exp(dt * A)  # (B, T, D)
+        alpha = torch.exp((dt * A).clamp(min=-20.0, max=20.0))  # (B, T, D)
 
         # Prefix products for alpha to compute recurrence in closed form.
         prefix = torch.cumprod(alpha, dim=1)  # (B, T, D)

@@ -179,12 +179,7 @@ def train_loop(
 
     use_scaler = device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
-    amp_dtype = torch.bfloat16 if device.type == "mps" else torch.float16
-    autocast = (
-        lambda: torch.amp.autocast(device_type=device.type, enabled=True, dtype=amp_dtype)
-        if use_scaler or device.type == "mps"
-        else torch.amp.autocast(device_type=device.type, enabled=False)
-    )
+    autocast = torch.amp.autocast if use_scaler else lambda *args, **kwargs: torch.autograd.profiler.record_function("no_autocast")
 
     start_epoch = 0
     best_val = float("inf")
@@ -205,7 +200,8 @@ def train_loop(
             x = x.to(device)
             y = y.to(device)
 
-            with autocast():
+            # Disable autocast on MPS/CPU to avoid BF16-induced NaNs; only CUDA uses autocast.
+            with (autocast(device_type="cuda", dtype=torch.float16, enabled=use_scaler) if use_scaler else torch.autograd.profiler.record_function("fp32")):
                 logits = model(x)
                 loss = nn.functional.cross_entropy(
                     logits.view(-1, vocab_size), y.view(-1)
