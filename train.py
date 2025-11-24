@@ -322,16 +322,32 @@ def train_loop(
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Train Q-SSD on Tiny Shakespeare.")
+    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--block_size", type=int, default=128)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--weight_decay", type=float, default=0.01)
+    parser.add_argument("--warmup_steps", type=int, default=50)
+    parser.add_argument("--grad_accum_steps", type=int, default=2)
+    parser.add_argument("--resume_from", type=str, default=None)
+    parser.add_argument("--ckpt_dir", type=str, default="checkpoints")
+    parser.add_argument("--max_train_steps_per_epoch", type=int, default=200)
+    parser.add_argument("--max_val_steps_per_epoch", type=int, default=50)
+    args = parser.parse_args()
+
     train_loop(
-        epochs=1,
-        batch_size=16,
-        block_size=128,
-        lr=1e-3,
-        weight_decay=0.01,
-        warmup_steps=50,
-        grad_accum_steps=2,
-        resume_from=None,
-        ckpt_dir="checkpoints",
-        max_train_steps_per_epoch=200,
-        max_val_steps_per_epoch=50,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        block_size=args.block_size,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        warmup_steps=args.warmup_steps,
+        grad_accum_steps=args.grad_accum_steps,
+        resume_from=args.resume_from,
+        ckpt_dir=args.ckpt_dir,
+        max_train_steps_per_epoch=args.max_train_steps_per_epoch,
+        max_val_steps_per_epoch=args.max_val_steps_per_epoch,
     )
