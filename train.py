@@ -142,6 +142,8 @@ def train_loop(
     grad_accum_steps: int = 4,
     resume_from: Optional[str] = None,
     ckpt_dir: str = "checkpoints",
+    max_train_steps_per_epoch: Optional[int] = 512,
+    max_val_steps_per_epoch: Optional[int] = 128,
 ) -> None:
     device = get_device()
     print(f"Using device: {device}")
@@ -168,7 +170,9 @@ def train_loop(
     model = QSSDModel(config).to(device)
 
     optimizer = create_optimizer(model, lr=lr, weight_decay=weight_decay)
-    total_train_steps = math.ceil(len(train_loader) / grad_accum_steps) * epochs
+    total_train_steps = math.ceil(
+        (max_train_steps_per_epoch or len(train_loader)) / grad_accum_steps
+    ) * epochs
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer, lr_lambda=cosine_with_warmup(warmup_steps, total_train_steps)
     )
@@ -189,7 +193,7 @@ def train_loop(
         start_epoch, best_val = load_checkpoint(resume_from, model, optimizer, scheduler)
         print(f"Resumed from {resume_from} at epoch {start_epoch}, best_val={best_val:.4f}")
 
-    def run_epoch(loader, train: bool) -> float:
+    def run_epoch(loader, train: bool, max_steps: Optional[int]) -> float:
         model.train(train)
         total_loss = 0.0
         total_steps = 0
@@ -197,7 +201,6 @@ def train_loop(
 
         optimizer.zero_grad(set_to_none=True)
 
-        step = 0
         for step, (x, y) in enumerate(loader, 1):
             x = x.to(device)
             y = y.to(device)
@@ -223,15 +226,6 @@ def train_loop(
                         optimizer.step()
                     scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
-            # Final flush if dataset size not divisible by grad_accum_steps
-        if train and step > 0 and step % grad_accum_steps != 0:
-            if use_scaler:
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                optimizer.step()
-            scheduler.step()
-            optimizer.zero_grad(set_to_none=True)
 
             total_loss += loss.item() * grad_accum_steps
             total_steps += 1
@@ -248,6 +242,19 @@ def train_loop(
                     f"Time: {elapsed:.1f}s"
                 )
 
+            if max_steps is not None and step >= max_steps:
+                break
+
+        # Flush leftover grads when early breaking or non-multiple batch count.
+        if train and (total_steps % grad_accum_steps) != 0:
+            if use_scaler:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad(set_to_none=True)
+
         return total_loss / max(total_steps, 1)
 
     for epoch in range(start_epoch + 1, epochs + 1):
@@ -258,8 +265,12 @@ def train_loop(
             f"batch_size: {batch_size}, "
             f"grad_accum: {grad_accum_steps}"
         )
-        train_loss = run_epoch(train_loader, train=True)
-        val_loss = run_epoch(val_loader, train=False)
+        train_loss = run_epoch(
+            train_loader, train=True, max_steps=max_train_steps_per_epoch
+        )
+        val_loss = run_epoch(
+            val_loader, train=False, max_steps=max_val_steps_per_epoch
+        )
         print(
             f"Epoch {epoch} done | Train Loss: {train_loss:.4f} | "
             f"Val Loss: {val_loss:.4f}"
@@ -310,4 +321,6 @@ if __name__ == "__main__":
         grad_accum_steps=4,
         resume_from=None,
         ckpt_dir="checkpoints",
+        max_train_steps_per_epoch=512,
+        max_val_steps_per_epoch=128,
     )
